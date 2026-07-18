@@ -7,7 +7,7 @@
 # -> lerobot) plus the SO100 leader-bus SDK. Idempotent: safe to re-run.
 #
 # Usage:  ./setup_so100.sh
-# After:  conda activate ai2_yam   (then see docs/COLLECTION_QUICKSTART.md)
+# After:  conda activate ai2_yam   (then see COLLECTION_QUICKSTART.md at the molmoact2 repo root)
 # =============================================================================
 set -euo pipefail
 
@@ -43,4 +43,4 @@ run pip install feetech-servo-sdk huggingface_hub
 echo
 echo "Done. Next steps:"
 echo "  conda activate ai2_yam"
-echo "  # then follow docs/COLLECTION_QUICKSTART.md (config placeholders, then ./run_so100_collection.sh)"
+echo "  # then follow COLLECTION_QUICKSTART.md at the molmoact2 repo root (config placeholders, startup, collection)"
