@@ -1,0 +1,132 @@
+# Copy of yam_left.yaml with the GELLO agent block swapped for the SO100
+# leader agent (docs/so100_collection_finetune_plan.md, Phase 1). Everything
+# else (channels, cameras, storage, lerobot, policy, eval) is kept intact.
+
+# cameras
+sensors:
+  cameras:
+    left_camera:
+      device_id: "352122273468"
+    front_camera:
+      device_id: "037522250599"
+    right_camera:
+      device_id: "352122272526"
+
+# robot info
+robot:
+  _target_: gello.robots.yam.YAMRobot
+  channel: can_leader_l
+agent:
+  _target_: gello.agents.so100_agent.SO100LeaderAgent
+  # TODO: replace with this rig's left SO100 leader serial adapter by-id path
+  # (ls /dev/serial/by-id/ with only the left leader plugged in).
+  port: /dev/serial/by-id/usb-...
+  # Produced by scripts/calibrate_so100_leader.py --arm left
+  calibration_path: configs/so100_calibration_left.json
+  # SO100 joint i (servo order 1-5) drives YAM joint yam_joint_indices[i];
+  # the remaining YAM joint is pinned. Settle these during rig calibration.
+  yam_joint_indices: [0, 1, 2, 3, 4]
+  pinned_joint_index: 5
+  pinned_joint_value: 0.0
+  # [open, closed] YAM gripper command values the trigger extremes map onto.
+  gripper_range: [0.0, 1.0]
+  # Smoothing: EMA factor in (0, 1] (1.0 = off) and per-step joint-delta
+  # clamp in radians (<= 0 = off).
+  ema_alpha: 0.4
+  max_joint_delta: 0.1
+  servo_ids: [1, 2, 3, 4, 5, 6]
+  baudrate: 1000000
+  start_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+hz: 30
+max_steps: 1000
+
+# Data collection configuration
+# TODO add a flag to selectively save the data or not
+collection:
+  max_episode_length: 10000
+  act_noise_std: 0.001
+  no_ops_threshold: 0.004
+  no_ops_last_detected_time: 3
+  lock_rotation_detected_time: 1
+
+# Data storage configuration
+storage:
+  episodes: 100
+  base_dir: "/home/kostas-lab/projects/YAM"
+  task_directory: "shirt"
+  language_instruction: 'Put the can into the basket'
+  teleop_device: "so100" # ["oculus", "keyboard", "gello", "so100", "none"]
+  save_format: "json" # ["json", "npy"]
+  saver_max_workers: 2
+  png_compress_level: 1
+  old_format: false
+
+# LeRobot conversion + upload pipeline
+lerobot:
+  auto_convert: true
+  auto_upload: false
+  hf_repo_id: "zhihaoteo/hackathon"  # TODO: replace "zhihaoteo" with the uploading account's real HF username
+  delete_local_after_upload: true
+  fps: 30
+  robot_type: "bi_yam_follower"  # matches meta/info.json of the released allenai YAM datasets
+  skip_initial_frames: 0
+  action_mode: "next_joint_fields" # ["next_joint_fields", "next_state", "copy_state"]
+  vcodec: "h264"
+  image_writer_processes: 8
+  image_writer_threads: 8
+  parallel_encoding: true
+  sanitize_online_viz_meta: true
+
+# Policy configuration
+policy:
+  type: "pi05"
+  repo_id: "williamtsai726/add_milk_to_the_coffee_0326"
+  # checkpoint_path: "Jiafei1224/pi-snack"
+  checkpoint_path: "lerobot/pi05_base"
+
+# Eval session configuration (used by launch_yaml_eval_molmoact.py)
+eval:
+  live_view_enabled: true        # show the 3-pane cv2 window during rollouts
+  # How to run inference:
+  #   server -> POST observations to a remote FastAPI MolmoAct server (default)
+  #   local  -> load the MolmoAct checkpoint in-process via transformers
+  # when mode == server. Accepts either:
+  #   - a full URL (e.g. "https://<ngrok-subdomain>.ngrok-free.dev")
+  #   - a bare host:port (e.g. "10.102.245.84:8202") -- http:// is assumed
+  # Trailing "/act" is appended automatically if missing.
+
+  # uncomment this 2 lines to use server
+  # mode: server #
+  # molmoact_server: "10.102.245.84:8202"
+
+  # Used when mode == local. Requires transformers (+ huggingface_hub, PIL,
+  # accelerate, safetensors) installed in the active env. bf16 needs ~10-14 GB
+  # VRAM; fp32 needs ~26 GB. Warmup eats the ~30 s first-call latency at
+  # startup so rollout step 0 isn't slow.
+
+  # uncomment following  lines to use server
+  mode: local
+  local:
+    repo_id: "allenai/MolmoAct2-BimanualYAM"
+    device: "cuda:0"
+    dtype: "bfloat16"            # bfloat16 | float16 | float32
+    num_steps: 10                # denoising steps!!
+    enable_cuda_graph: false
+    warmup: true                # warm up the model with dummy obs
+
+  # Optional camera-server architecture. When enabled=true, the eval launcher
+  # talks to a long-lived camera server over ZMQ instead of opening RealSense
+  # devices itself. Start the server with:
+  #     scripts/start_camera_server.sh configs/yam_left.yaml
+  # The server owns all 3 cameras for the duration of the workstation session;
+  # the eval client pulls a fresh obs only when the policy needs one.
+  camera_server:
+    enabled: true
+    endpoint: "tcp://127.0.0.1:5555"
+    request_timeout_ms: 500
+    max_frame_age_sec: 0.5
+    # PUB stream the live cv2 viewer subscribes to. Decouples viewer rendering
+    # from policy.inference() so the viewer keeps refreshing during inference.
+    pub_endpoint: "tcp://127.0.0.1:5556"
+    recv_timeout_ms: 100
+  # max_steps and lerobot.* are reused from the existing top-level blocks above.

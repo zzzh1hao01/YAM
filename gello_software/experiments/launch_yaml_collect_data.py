@@ -25,6 +25,11 @@ from gello.data_utils.keyboard_interface import KBReset
 from gello.utils.control_utils import run_control_loop_prior
 from gello.zmq_core.camera_node import ZMQClientCamera, ZMQServerCamera
 
+# Accepted values for storage.teleop_device. Metadata only: it is recorded
+# with each episode; the actual input device is selected by the agent block
+# (agent._target_) in the config.
+TELEOP_DEVICES = ("oculus", "keyboard", "gello", "so100", "none")
+
 # Global variables for cleanup
 active_threads = []
 active_servers = []
@@ -218,6 +223,10 @@ def get_joint_offsets(
     return best_offsets
 
 def update_offsets(cfg):
+    if "dynamixel_config" not in cfg["agent"]:
+        # Non-Dynamixel leader (e.g. gello.agents.so100_agent.SO100LeaderAgent):
+        # offsets come from the agent's own calibration file.
+        return cfg
     joint_offsets = get_joint_offsets(cfg, cfg["agent"]["port"])
     cfg["agent"]["dynamixel_config"]["joint_offsets"] = joint_offsets
     return cfg
@@ -355,6 +364,12 @@ def main():
     left_cfg = OmegaConf.to_container(
         OmegaConf.load(args.left_config_path), resolve=True
     )
+    teleop_device = left_cfg.get("storage", {}).get("teleop_device")
+    if teleop_device is not None and teleop_device not in TELEOP_DEVICES:
+        print(
+            f"Warning: storage.teleop_device={teleop_device!r} is not one of "
+            f"{TELEOP_DEVICES}; recording it as-is."
+        )
     left_cfg = update_offsets(left_cfg)
     if bimanual:
         right_cfg = OmegaConf.to_container(

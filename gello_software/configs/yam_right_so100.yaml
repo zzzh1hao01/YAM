@@ -1,0 +1,29 @@
+# Copy of yam_right.yaml with the GELLO agent block swapped for the SO100
+# leader agent (docs/so100_collection_finetune_plan.md, Phase 1).
+
+robot:
+  _target_: gello.robots.yam.YAMRobot
+  channel: can_follower_r
+agent:
+  _target_: gello.agents.so100_agent.SO100LeaderAgent
+  # TODO: replace with this rig's right SO100 leader serial adapter by-id path
+  # (ls /dev/serial/by-id/ with only the right leader plugged in).
+  port: /dev/serial/by-id/usb-...
+  # Produced by scripts/calibrate_so100_leader.py --arm right
+  calibration_path: configs/so100_calibration_right.json
+  # SO100 joint i (servo order 1-5) drives YAM joint yam_joint_indices[i];
+  # the remaining YAM joint is pinned. Settle these during rig calibration.
+  yam_joint_indices: [0, 1, 2, 3, 4]
+  pinned_joint_index: 5
+  pinned_joint_value: 0.0
+  # [open, closed] YAM gripper command values the trigger extremes map onto.
+  gripper_range: [0.0, 1.0]
+  # Smoothing: EMA factor in (0, 1] (1.0 = off) and per-step joint-delta
+  # clamp in radians (<= 0 = off).
+  ema_alpha: 0.4
+  max_joint_delta: 0.1
+  servo_ids: [1, 2, 3, 4, 5, 6]
+  baudrate: 1000000
+  start_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+hz: 30
+max_steps: 1000

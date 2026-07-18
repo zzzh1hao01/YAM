@@ -91,6 +91,29 @@ STATE_DIM_NAMES = [
 ]
 
 
+# LeRobot feature key per raw camera source dir ("<name>_rgb/" stripped to "<name>").
+# These must match the training mixture tag `yam_dual_molmoact2`
+# (experiments/launch_scripts/data_mixtures.py) and the released
+# allenai/MolmoAct2-BimanualYAM datasets: observation.images.{top,left,right}.
+# Older versions of this script emitted observation.images.camera_{front,left,right};
+# no downstream consumer of those keys exists, so this is a clean rename.
+CAMERA_FEATURE_KEYS = {
+    "front": "observation.images.top",    # base/front camera
+    "left": "observation.images.left",    # left wrist camera
+    "right": "observation.images.right",  # right wrist camera
+}
+
+
+def _camera_feature_key(cam_name: str) -> str:
+    """Map a raw camera source name ("front"/"left"/"right") to its LeRobot feature key."""
+    try:
+        return CAMERA_FEATURE_KEYS[cam_name]
+    except KeyError:
+        raise ValueError(
+            f"Unknown camera source '{cam_name}'; expected one of {sorted(CAMERA_FEATURE_KEYS)}"
+        ) from None
+
+
 def _sorted_image_files(camera_dir: Path) -> List[Path]:
     """Sort images by numeric stem when possible, fallback to lexical order."""
     image_files = [f for f in camera_dir.iterdir() if f.suffix.lower() in [".png", ".jpg", ".jpeg"]]
@@ -401,7 +424,8 @@ def create_lerobot_dataset_v30(
     camera_shapes = infer_camera_shapes(episodes, camera_names)
     image_dim_names = ["height", "width", "channels"]
 
-    # Feature schema (same keys and shapes as the v2.1 script; v3.0 layout is handled by LeRobot).
+    # Feature schema. Camera keys follow CAMERA_FEATURE_KEYS (observation.images.{top,left,right}),
+    # matching the `yam_dual_molmoact2` training mixture and released MolmoAct2-BimanualYAM datasets.
     features: Dict[str, Dict[str, Any]] = {
         # Robot joint positions
         "observation.state": {
@@ -419,7 +443,7 @@ def create_lerobot_dataset_v30(
         # Image observations
     }
     for cam_name in camera_names:
-        features[f"observation.images.camera_{cam_name}"] = {
+        features[_camera_feature_key(cam_name)] = {
             "dtype": "video",
             "shape": camera_shapes[cam_name],
             "names": image_dim_names,
@@ -465,7 +489,7 @@ def create_lerobot_dataset_v30(
             for cam_name in camera_names:
                 # Open only this specific frame's image
                 with Image.open(cam_paths[cam_name][f_idx]) as img:
-                    frame_data[f"observation.images.camera_{cam_name}"] = img.convert("RGB")
+                    frame_data[_camera_feature_key(cam_name)] = img.convert("RGB")
 
             dataset.add_frame(frame_data)
 
