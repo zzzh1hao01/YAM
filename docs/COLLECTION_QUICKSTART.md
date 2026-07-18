@@ -9,7 +9,7 @@ Background/design context: `docs/so100_collection_finetune_plan.md`.
 ## 1. Clone + install (once)
 
 ```bash
-git clone -b so100-yam-finetune https://github.com/zzzh1hao01/YAM.git
+git clone https://github.com/zzzh1hao01/YAM.git
 cd YAM
 ./setup_so100.sh          # creates conda env ai2_yam, installs i2rt/gello/lerobot + feetech SDK
 conda activate ai2_yam
