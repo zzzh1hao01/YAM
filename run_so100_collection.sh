@@ -6,9 +6,12 @@
 #   preflight checks -> CAN/watchdog startup -> (calibration if needed) ->
 #   teleop collection -> post-session reminders.
 #
+# Assumes the SO100 leader arms are ALREADY CALIBRATED: the calibration JSONs
+# referenced by agent.calibration_path in the so100 yamls must exist
+# (lerobot-style per-motor calibration files are also accepted by the agent).
+#
 # Usage (on the rig machine, any directory):
 #   ./run_so100_collection.sh              # full flow: checks, CAN, collect
-#   ./run_so100_collection.sh calibrate    # (re)run per-arm calibration only
 #   ./run_so100_collection.sh replay       # open-loop replay gate for recorded episodes
 #   ./run_so100_collection.sh --skip-can   # skip CAN reset/watchdog (already done this boot)
 #
@@ -29,7 +32,7 @@ MODE="collect"
 SKIP_CAN=0
 for arg in "$@"; do
   case "$arg" in
-    calibrate|replay|collect) MODE="$arg" ;;
+    replay|collect) MODE="$arg" ;;
     --skip-can) SKIP_CAN=1 ;;
     -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     *) echo "Unknown arg: $arg (try --help)"; exit 1 ;;
@@ -104,15 +107,13 @@ else
   python "$REPO_ROOT/i2rt/i2rt/motor_config_tool/set_timeout.py" --channel can_follower_r --timeout
 fi
 
-# -------------------------------------------------------------- calibration --
-if [ "$MODE" = "calibrate" ] || [ ! -f "$CAL_LEFT" ] || [ ! -f "$CAL_RIGHT" ]; then
-  say "Calibration (interactive; leaders are moved by hand, motors never commanded)"
-  cd "$GELLO"
-  [ "$MODE" = "calibrate" ] || warn "calibration JSON(s) missing -- running calibration first."
-  [ -f "$CAL_LEFT" ]  && [ "$MODE" != "calibrate" ] || python scripts/calibrate_so100_leader.py --arm left
-  [ -f "$CAL_RIGHT" ] && [ "$MODE" != "calibrate" ] || python scripts/calibrate_so100_leader.py --arm right
-  [ "$MODE" = "calibrate" ] && { say "Calibration done. Re-run without 'calibrate' to collect."; exit 0; }
-fi
+# -------------------------------------------------- calibration (pre-done) --
+for cal in "$CAL_LEFT" "$CAL_RIGHT"; do
+  [ -f "$cal" ] || die "calibration file missing: $cal
+  The arms are assumed pre-calibrated. Point agent.calibration_path in the
+  so100 yamls at your existing calibration files (lerobot-style per-motor
+  JSONs are also accepted by SO100LeaderAgent)."
+done
 
 # ------------------------------------------------------------------ collect --
 cd "$GELLO"
