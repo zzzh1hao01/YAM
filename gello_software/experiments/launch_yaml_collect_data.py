@@ -1,6 +1,7 @@
 import atexit
 from math import inf
 from multiprocessing import Process
+import os
 import signal
 import shutil
 import subprocess
@@ -9,7 +10,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import tyro
 import zmq.error
@@ -45,6 +46,7 @@ _robot_client = None
 _cameras = None
 _data_saver = None
 _kb_interface = None
+_rerun_collector = None  # optional Rerun take recorder (see --rerun / YAM_RERUN=1)
 
 
 def _call_cleanup_methods(resource, resource_name: str, methods: list[str]) -> None:
@@ -82,11 +84,22 @@ def cleanup():
     """Clean up resources before exit."""
     global cleanup_in_progress
     global _env, _agent, _robot, _robot_client, _cameras, _data_saver, _kb_interface
+    global _rerun_collector
     if cleanup_in_progress:
         return
     cleanup_in_progress = True
 
     print("Cleaning up resources...")
+
+    # Close any in-progress Rerun take first (fast: stamps properties + flushes the
+    # .rrd footer) so an interrupted episode is still a valid recording on disk.
+    if _rerun_collector is not None:
+        try:
+            _rerun_collector.close()
+        except Exception as e:
+            print(f"Error closing rerun collector: {e}")
+        _rerun_collector = None
+
     try:
         if _env is not None and _left_cfg is not None:
             if _bimanual:
@@ -178,8 +191,337 @@ class Args:
     right_config_path: Optional[str] = None
     """Path to the right arm configuration YAML file (for bimanual operation)."""
 
+    rerun: bool = False
+    """Also record each episode as a Rerun take (.rrd) via yam_rerun (molmoact2 repo
+    root). Same as setting YAM_RERUN=1. Requires rerun-sdk==0.34.1 importable; if the
+    import fails a warning is printed and collection runs unchanged. The existing
+    JSON/PNG save path stays ON in parallel either way."""
+
     # use_save_interface: bool = False
     # """Enable saving data with keyboard interface."""
+
+
+# --------------------------------------------------------------------------------------
+# Optional Rerun take recording (--rerun / YAM_RERUN=1).
+#
+# Everything below is import-guarded: rerun-sdk and the yam_rerun package (which lives at
+# the molmoact2 repo root, three levels above this file) are only imported inside
+# _make_rerun_collector(), so this launcher runs unchanged on machines without them.
+#
+# Per plan (rerun-yam-port-plan.md Phase 1), each saved-or-discarded episode becomes a
+# "take": a RecordingStream teed to recordings/<dataset>/<episode>.rrd (+ the live gRPC
+# proxy on :9876 when yam_rerun.server is running), stamped with dataset/task/tag
+# properties, compacted with `rerun rrd optimize`, and registered into the local catalog
+# on :51234. Entity paths follow molmoact_to_lerobot_v30.py's contract:
+# camera/{top,left,right} (front camera == top), {left,right}_arm/{position,goal,velocity}
+# with the 14-D state split [left_joint1..6, left_gripper, right_joint1..6, right_gripper].
+#
+# GIL note (YAM/CLAUDE.md): take begin/finish are millisecond-scale; the expensive parts
+# (`rrd optimize` subprocess + catalog registration) run on a background thread, never on
+# the control loop while the 250 Hz CAN thread depends on the main thread yielding.
+# --------------------------------------------------------------------------------------
+
+_RERUN_CAMERA_PATHS = (
+    ("front_camera_rgb", "camera/top"),  # base/front camera -> observation.images.top
+    ("left_camera_rgb", "camera/left"),
+    ("right_camera_rgb", "camera/right"),
+)
+_RERUN_LEFT_DIMS = [f"left_joint{i}" for i in range(1, 7)] + ["left_gripper"]
+_RERUN_RIGHT_DIMS = [f"right_joint{i}" for i in range(1, 7)] + ["right_gripper"]
+
+
+def rerun_enabled(args: "Args") -> bool:
+    return bool(args.rerun) or os.environ.get("YAM_RERUN", "") == "1"
+
+
+class _RerunUrdf:
+    """Guarded adapter around yam_rerun.urdf_yam.DualYam.
+
+    ``DualYam.create()`` parses the YAM URDF once (called from _make_rerun_collector,
+    i.e. before the motors go live). Every logging call is guarded so a runtime failure
+    degrades to a one-line warning + no URDF animation, never a broken collection run.
+    """
+
+    def __init__(self, module) -> None:
+        self._dual = module.DualYam.create()
+        self.visual_paths = [arm.visual_geometries_path for arm in self._dual.arms]
+        self._disabled = False
+
+    def _guard(self, fn, *fn_args) -> None:
+        if self._disabled:
+            return
+        try:
+            fn(*fn_args)
+        except Exception as err:
+            self._disabled = True
+            print(f"[rerun]     urdf_yam call failed ({type(err).__name__}: {err}); URDF logging disabled", flush=True)
+
+    def log_static(self, rec) -> None:
+        self._guard(self._dual.log_static, rec)
+
+    def log_joints(self, rec, q14) -> None:
+        self._guard(self._dual.log_state, rec, q14)
+
+
+class _RerunCollector:
+    """Records each episode as a Rerun take, driven by three transparent wrappers.
+
+    The collection loop itself lives in gello.utils.control_utils.run_control_loop_prior
+    and is not modified; instead the objects this launcher passes into it are wrapped:
+
+    * kb_interface.update() results drive the take lifecycle: "start" begins a take,
+      "save" finishes it tagged "Good episode", "discard" tagged "Bad episode".
+    * env.step() logs one Rerun tick per control tick while a take is open (cameras,
+      position, goal = the gello leader command as actually sent to the robot, i.e.
+      minus the dynamic offset, velocities, URDF joints).
+    * data_saver.add_observation() counts ticks so an episode that hits
+      max_episode_length without a keypress (which run_control_loop_prior discards)
+      still closes its take (tagged "Needs review") BEFORE the between-episode
+      move_to_start ticks would pollute it.
+    """
+
+    def __init__(self, rr, takes, blueprint_mod, urdf, cfg: dict) -> None:
+        self._rr = rr
+        self._takes = takes
+        self._blueprint_mod = blueprint_mod
+        self._urdf = urdf
+        storage = cfg.get("storage", {})
+        self.dataset = takes.sanitize_name(str(storage.get("task_directory", "yam_dataset")))
+        self.task = str(storage.get("language_instruction", ""))
+        self.recordings_dir = takes.DEFAULT_RECORDINGS_DIR
+        self.catalog_uri = takes.DEFAULT_CATALOG_URI
+        self.jpeg_quality = int(cfg.get("rerun", {}).get("jpeg_quality", 75))
+        self.max_ticks = int(cfg.get("collection", {}).get("max_episode_length", 0)) or None
+        self.proxy_uri = self._probe_proxy(takes.DEFAULT_GRPC_PORT)
+        self._take = None
+        self._episode = None
+        self._path = None
+        self._ticks = 0
+        self._pending: list[threading.Thread] = []
+        self._warned_tick = False
+        print(
+            f"[rerun]     takes -> {self.recordings_dir / self.dataset}/ "
+            f"(dataset '{self.dataset}', live proxy {'ON' if self.proxy_uri else 'OFF -- start yam_rerun.server for live view'})",
+            flush=True,
+        )
+
+    @staticmethod
+    def _probe_proxy(port: int) -> Optional[str]:
+        import socket
+
+        try:
+            with socket.create_connection(("localhost", port), timeout=0.3):
+                return f"rerun+http://localhost:{port}/proxy"
+        except OSError:
+            return None
+
+    # --- wrappers ---------------------------------------------------------------
+
+    def wrap_env(self, env):
+        collector = self
+
+        class _Env:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def step(self, joints, reset: Optional[bool] = False):
+                obs = self._inner.step(joints, reset=reset)
+                if collector._take is not None:
+                    offset = getattr(self._inner, "_dynamic_offset", None)
+                    goal = joints if offset is None else joints - offset
+                    collector.log_tick(goal, obs)
+                return obs
+
+        return _Env(env)
+
+    def wrap_kb(self, kb):
+        collector = self
+
+        class _KB:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def update(self, dashboard_data: Optional[Dict[str, Any]] = None) -> str:
+                result = self._inner.update(dashboard_data)
+                phase = (dashboard_data or {}).get("phase")
+                if result == "start" and phase == "waiting_start":
+                    collector.begin()
+                elif result == "save":
+                    collector.finish("Good episode")
+                elif result == "discard":
+                    collector.finish("Bad episode")
+                return result
+
+        return _KB(kb)
+
+    def wrap_data_saver(self, saver):
+        collector = self
+
+        class _Saver:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            def add_observation(self, obs):
+                self._inner.add_observation(obs)
+                collector.note_saved_tick()
+
+        return _Saver(saver)
+
+    # --- take lifecycle ---------------------------------------------------------
+
+    def begin(self) -> None:
+        if self._take is not None:
+            return
+        rr, takes = self._rr, self._takes
+        try:
+            episode = takes.next_episode(self.recordings_dir, self.dataset)
+            path = takes.episode_path(self.recordings_dir, self.dataset, episode)
+            rec = takes.begin_take(path, episode=episode, dataset=self.dataset, task=self.task, proxy_uri=self.proxy_uri)
+            # Static per-take data: series names (plot legends) + the URDF meshes.
+            for arm, names in (("left_arm", _RERUN_LEFT_DIMS), ("right_arm", _RERUN_RIGHT_DIMS)):
+                rec.log(f"{arm}/position", rr.SeriesLines(names=names), static=True)
+                rec.log(f"{arm}/goal", rr.SeriesLines(names=[f"{n} goal" for n in names]), static=True)
+                rec.log(f"{arm}/velocity", rr.SeriesLines(names=names), static=True)
+            if self._urdf is not None:
+                self._urdf.log_static(rec)
+            self._take = rec
+            self._episode = episode
+            self._path = path
+            self._ticks = 0
+            print(f"[rerun]     take started: {path}", flush=True)
+        except Exception as err:
+            self._take = None
+            print(f"[rerun]     failed to start take ({type(err).__name__}: {err}); episode not recorded to rerun", flush=True)
+
+    def log_tick(self, goal14, obs) -> None:
+        rec = self._take
+        if rec is None:
+            return
+        rr = self._rr
+        try:
+            rec.set_time("time", timestamp=time.time())
+            q = np.asarray(obs["joint_positions"], dtype=np.float64)
+            rec.log("left_arm/position", rr.Scalars(q[:7]))
+            rec.log("right_arm/position", rr.Scalars(q[7:14]))
+            if goal14 is not None:
+                g = np.asarray(goal14, dtype=np.float64)
+                if g.shape[0] >= 14:
+                    rec.log("left_arm/goal", rr.Scalars(g[:7]))
+                    rec.log("right_arm/goal", rr.Scalars(g[7:14]))
+            vel = obs.get("joint_velocities")
+            if vel is not None:
+                v = np.asarray(vel, dtype=np.float64)
+                if v.shape[0] >= 14:
+                    rec.log("left_arm/velocity", rr.Scalars(v[:7]))
+                    rec.log("right_arm/velocity", rr.Scalars(v[7:14]))
+            # The RealSense frames arrive as raw RGB arrays here (in-process camera path;
+            # no ZMQ JPEG bytes exist in this launcher), so encode once to JPEG.
+            for obs_key, entity_path in _RERUN_CAMERA_PATHS:
+                image = obs.get(obs_key)
+                if image is not None:
+                    rec.log(entity_path, rr.Image(image).compress(jpeg_quality=self.jpeg_quality))
+            if self._urdf is not None:
+                self._urdf.log_joints(rec, q)
+        except Exception as err:
+            if not self._warned_tick:
+                self._warned_tick = True
+                print(f"[rerun]     tick logging failed ({type(err).__name__}: {err}); further errors suppressed", flush=True)
+
+    def note_saved_tick(self) -> None:
+        if self._take is None:
+            return
+        self._ticks += 1
+        if self.max_ticks is not None and self._ticks >= self.max_ticks:
+            # Episode hit max_episode_length with no keypress: run_control_loop_prior
+            # discards it, and the next thing it does is drive the arms home -- close
+            # the take now so those ticks don't leak into the recording.
+            self.finish("Needs review")
+
+    def finish(self, tag: str, *, background: bool = True) -> None:
+        rec, self._take = self._take, None
+        if rec is None:
+            return
+        takes = self._takes
+        path, episode = self._path, self._episode
+        try:
+            takes.finish_take(rec, dataset=self.dataset, task=self.task, tag=tag, proxy_uri=None)
+        except Exception as err:
+            print(f"[rerun]     failed to finalize take {path} ({type(err).__name__}: {err})", flush=True)
+            return
+        print(f"[rerun]     take stopped: {episode} (tag: {tag})", flush=True)
+
+        def _postprocess() -> None:
+            # Off the control loop: `rrd optimize` (subprocess) + catalog registration
+            # (gRPC). Registration failure is fine -- the server rescan picks it up.
+            try:
+                takes.optimize_rrd(path)
+            except Exception as err:
+                print(f"[rerun]     optimize failed for {path} ({type(err).__name__}: {err})", flush=True)
+            try:
+                registration = takes.register_rrd(self.catalog_uri, self.dataset, path)
+                print(f"[rerun]     registered {episode} in dataset '{self.dataset}' (segments: {registration['segment_ids']})", flush=True)
+                if self._blueprint_mod is not None:
+                    visual_paths = self._urdf.visual_paths if self._urdf is not None else None
+                    if self._blueprint_mod.register_dataset_blueprint(
+                        self.catalog_uri, self.recordings_dir, self.dataset, visual_paths=visual_paths
+                    ):
+                        print(f"[rerun]     default blueprint set for dataset '{self.dataset}'", flush=True)
+            except Exception as err:
+                print(
+                    f"[rerun]     catalog registration skipped for {path} ({type(err).__name__}: {err}) -- "
+                    "yam_rerun.server rescans recordings/ on startup",
+                    flush=True,
+                )
+
+        if background:
+            worker = threading.Thread(target=_postprocess, name="rerun-postprocess", daemon=True)
+            worker.start()
+            self._pending.append(worker)
+        else:
+            _postprocess()
+
+    def close(self) -> None:
+        # An interrupted episode is worth keeping for triage -> "Needs review".
+        # Postprocess synchronously: we're exiting, daemon threads won't survive.
+        self.finish("Needs review", background=False)
+        for worker in self._pending:
+            worker.join(timeout=60)
+        self._pending.clear()
+
+
+def _make_rerun_collector(cfg: dict) -> Optional[_RerunCollector]:
+    """Build the collector, or return None (with a warning) if rerun isn't available."""
+    repo_root = Path(__file__).resolve().parents[3]  # molmoact2/ (this file: molmoact2/YAM/gello_software/experiments/)
+    if (repo_root / "yam_rerun").is_dir() and str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    try:
+        import rerun as rr
+        from yam_rerun import takes
+    except Exception as err:
+        print(f"[rerun]     disabled: {type(err).__name__}: {err} (need rerun-sdk==0.34.1 + yam_rerun on sys.path)", flush=True)
+        return None
+    try:
+        from yam_rerun import blueprint as blueprint_mod
+    except Exception as err:
+        print(f"[rerun]     blueprint module unavailable ({type(err).__name__}: {err}); recording without a default blueprint", flush=True)
+        blueprint_mod = None
+    urdf = None
+    try:
+        from yam_rerun import urdf_yam
+
+        urdf = _RerunUrdf(urdf_yam)
+    except Exception as err:
+        print(f"[rerun]     urdf_yam unavailable ({type(err).__name__}: {err}); recording without URDF animation", flush=True)
+    return _RerunCollector(rr, takes, blueprint_mod, urdf, cfg)
 
 
 def signal_handler(signum, frame):
@@ -387,6 +729,13 @@ def main():
     )
     kb_interface = KBReset()
 
+    # Build the Rerun collector (if enabled) BEFORE any robot is constructed: importing
+    # rerun-sdk takes seconds and holds the GIL, which would starve the 250 Hz CAN
+    # thread once the motors are live (see YAM/CLAUDE.md's watchdog note).
+    global _rerun_collector
+    if rerun_enabled(args):
+        _rerun_collector = _make_rerun_collector(left_cfg)
+
     camera_cfg = left_cfg["sensors"]["cameras"]
     cameras = {
         "left_camera": RealSenseCamera(camera_cfg["left_camera"]["device_id"]),
@@ -512,6 +861,14 @@ def main():
         f"Launching robot: {robot.__class__.__name__}, agent: {agent.__class__.__name__}"
     )
     print(f"Control loop: {cfg.get('hz', 30)} Hz")
+
+    # Optional Rerun take recording: wrap the objects fed into the (unmodified)
+    # collection loop. The collector itself was built before the robot went live;
+    # wrapping is allocation-only, and per-tick logging is native/cheap.
+    if _rerun_collector is not None:
+        env = _rerun_collector.wrap_env(env)
+        data_saver = _rerun_collector.wrap_data_saver(data_saver)
+        kb_interface = _rerun_collector.wrap_kb(kb_interface)
 
     # from gello.utils.control_utils import SaveInterface, run_control_loop
 
